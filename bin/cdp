@@ -367,6 +367,9 @@ config_dir_of_profile() {
 # reset to what launchd would give a Spotlight-launched app, so nothing from
 # the calling shell (a terminal, a Claude Code session) leaks in either.
 launch_clone() {
+  # zsh's BG_NICE (on by default) would start the `&!` clone at nice 5, and
+  # every Helper/renderer inherits it: the whole UI then lags.
+  setopt local_options no_bg_nice
   local clone="$1" data_dir="$2" cfg
   cfg=$(config_dir_of_profile "$data_dir")
   # Hard invariant: a clone process must never exist without BOTH its
@@ -798,6 +801,9 @@ cmd_watch() {
 # Installs/removes the LaunchAgent that runs `cdp watch`. Idempotent: rewrites
 # and reloads only when the plist content changed or the agent isn't loaded;
 # --restart also restarts an up-to-date agent.
+# The watch re-launches strays itself, so its children inherit its launchd
+# policy: Background would throttle the profile's UI to priority 4.
+# AbandonProcessGroup keeps a reload from killing those profile windows.
 install_watchdog() {
   local quiet="${1:-}" restart="${2:-}" tmp
   tmp=$(mktemp)
@@ -815,7 +821,8 @@ install_watchdog() {
 	</array>
 	<key>RunAtLoad</key><true/>
 	<key>KeepAlive</key><true/>
-	<key>ProcessType</key><string>Background</string>
+	<key>ProcessType</key><string>Interactive</string>
+	<key>AbandonProcessGroup</key><true/>
 </dict>
 </plist>
 EOF
