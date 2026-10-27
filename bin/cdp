@@ -25,7 +25,7 @@ set -euo pipefail
 # (FUNCTION_ARGZERO), which would break the self-copy into the chooser bundle.
 SCRIPT_PATH="${0:A}"
 
-CDP_VERSION="0.5.1"
+CDP_VERSION="0.5.2"
 
 APP_SUPPORT="$HOME/Library/Application Support"
 LAUNCHER_DIR="$HOME/Applications"
@@ -164,6 +164,7 @@ import CoreImage
 // helper seticon <icon> <target>                   Finder custom icon (Dock honors it,
 //                                                  and it does not break code signatures)
 // helper focus <pid>                               activate a running app by pid
+// helper quit <pid>                                ask that app to quit, like Cmd+Q
 let a = CommandLine.arguments
 guard a.count >= 3 else { exit(2) }
 let mode = a[1]
@@ -173,6 +174,12 @@ if mode == "focus" {
           let ra = NSRunningApplication(processIdentifier: pid) else { exit(3) }
     ra.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
     exit(0)
+}
+// By pid, not bundle id: every profile clone shares Claude's bundle id.
+if mode == "quit" {
+    guard let pid = Int32(a[2]),
+          let ra = NSRunningApplication(processIdentifier: pid) else { exit(3) }
+    exit(ra.terminate() ? 0 : 4)
 }
 if mode == "seticon" {
     guard a.count >= 4, let img = NSImage(contentsOfFile: a[2]) else { exit(2) }
@@ -1041,11 +1048,42 @@ profile_config_dir() {
   fi
 }
 
-profile_is_running() {
+# Main-process pid of a profile (the default install included), empty when
+# it isn't running.
+profile_pid() {
   if [[ "$1" == "$APP_SUPPORT/Claude" ]]; then
-    ps -axo command= 2>/dev/null | grep -F "/Claude.app/Contents/MacOS/Claude" | grep -v Helper | grep -vF -- "--user-data-dir=" | grep -q .
+    ps -axo pid=,command= 2>/dev/null | grep -F "/Claude.app/Contents/MacOS/Claude" | grep -v Helper | grep -vF -- "--user-data-dir=" | awk '{print $1}' | head -1 || true
   else
-    [[ -n "$(instance_pid "$1")" ]]
+    instance_pid "$1"
+  fi
+}
+
+profile_is_running() {
+  [[ -n "$(profile_pid "$1")" ]]
+}
+
+# Quits a running profile the way Cmd+Q does, so it saves its session list,
+# and waits up to a minute for it to exit. Never force-kills: if Claude is
+# holding the quit (a question on screen), we give up instead.
+quit_profile() {
+  local pid tool i
+  pid=$(profile_pid "$1")
+  [[ -n "$pid" ]] || return 0
+  tool=$(ensure_tint_tool) || err "The helper app is missing; quit the profile by hand (Cmd+Q)."
+  "$tool" quit "$pid" 2>/dev/null || return 1
+  for i in {1..120}; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# Opens a profile given its data dir, default install included.
+reopen_profile() {
+  if [[ "$1" == "$APP_SUPPORT/Claude" ]]; then
+    open -a "$(find_claude_app)"
+  else
+    launch_profile "${${1:t}#Claude-}"
   fi
 }
 
@@ -1155,19 +1193,21 @@ tree_synced() {
 
 # Moves, never copies: a session lives in exactly one profile, so it can't
 # be continued in two and then silently lose one side's turns on the way back.
+# --restart quits whichever of the two is running, moves, and reopens them.
 cmd_transfer() {
-  local force=0 dry=0 a
+  local force=0 dry=0 restart=0 a
   local -a pos
   for a in "$@"; do
     case "$a" in
       --move)    ;;  # the only mode; accepted for old scripts
       --force)   force=1 ;;
       --dry-run) dry=1 ;;
+      --restart) restart=1 ;;
       -*)        err "Unknown option $a" ;;
       *)         pos+=("${a%/}") ;;
     esac
   done
-  (( ${#pos} >= 3 )) || err "Usage: cdp transfer <from> <to> <project-path>... [--dry-run] [--force]"
+  (( ${#pos} >= 3 )) || err "Usage: cdp transfer <from> <to> <project-path>... [--restart] [--dry-run] [--force]"
   local from="${pos[1]}" to="${pos[2]}"
   local src_data dst_data src_cfg dst_cfg
   src_data=$(profile_data_dir "$from")
@@ -1176,11 +1216,34 @@ cmd_transfer() {
   src_cfg=$(profile_config_dir "$src_data")
   dst_cfg=$(profile_config_dir "$dst_data")
 
+  (( restart && ! dry )) || { transfer_sessions; return }
+  local -a reopen
+  local name dir rc=0
+  for name dir in "$from" "$src_data" "$to" "$dst_data"; do
+    profile_is_running "$dir" || continue
+    info "Quitting '$name'…"
+    if ! quit_profile "$dir"; then
+      print -u2 -- "✗ '$name' didn't quit within a minute (is it asking something?). Nothing moved."
+      rc=1
+      break
+    fi
+    reopen+=("$dir")
+  done
+  # A subshell, so a failed move (err exits) still reopens what we quit.
+  (( rc )) || ( transfer_sessions ) || rc=$?
+  for dir in "${reopen[@]}"; do reopen_profile "$dir" || rc=1; done
+  (( ${#reopen} )) && info "Reopened ${#reopen} profile(s)."
+  return $rc
+}
+
+# The move itself; reads cmd_transfer's locals (zsh scoping is dynamic).
+transfer_sessions() {
+  local a
   # A running instance keeps its sidebar in memory and writes it back, which
   # would drop the new entries (destination) or resurrect moved ones (source).
   if (( ! force && ! dry )); then
-    profile_is_running "$src_data" && err "Quit '$from' first (Cmd+Q), or pass --force."
-    profile_is_running "$dst_data" && err "Quit '$to' first (Cmd+Q), or pass --force."
+    profile_is_running "$src_data" && err "Quit '$from' first (Cmd+Q), or pass --restart."
+    profile_is_running "$dst_data" && err "Quit '$to' first (Cmd+Q), or pass --restart."
   fi
 
   local -A want
@@ -1340,12 +1403,12 @@ USAGE
   cdp projects <profile>
                       List a profile's Claude Code projects and sessions
                       ("default" is your main install)
-  cdp transfer <from> <to> <project-path>... [--dry-run]
+  cdp transfer <from> <to> <project-path>... [--restart] [--dry-run]
                       Move those projects' sessions (transcripts, /rewind
                       history, sidebar entries) to another profile; the
                       originals go to the Trash. Refuses sessions that
-                      differ on both sides. Both profiles must be quit
-                      (or pass --force)
+                      differ on both sides. Both profiles must be quit;
+                      --restart quits the running ones and reopens them
   cdp remove <name>   Remove a profile's launcher; add --keep-data or
                       --delete-data to skip the interactive question
   cdp gui             Build + install the "Claude Profiles" SwiftUI app

@@ -68,7 +68,7 @@ check "other project left alone" test -f "$A/claude-config/projects/-y-other/s3.
 
 # Continued in Beta, then moved back: Alpha gets the newer turns, once.
 print -r -- '{"type":"assistant","cwd":"/x/proj","sessionId":"s1"}' >> "$B/claude-config/projects/-x-proj/s1.jsonl"
-check "move back succeeds" cdp transfer beta alpha /x/proj
+check "move back succeeds (--restart, nothing running)" cdp transfer beta alpha /x/proj --restart
 check "moved back with the new turns" test "$(wc -l < "$A/claude-config/projects/-x-proj/s1.jsonl")" -eq 2
 check "moved back into the source account" test -f "$A/claude-code-sessions/acct/org/local_a.json"
 check "no sidebar duplicate" test "$(print -l "$A"/claude-code-sessions/*/*/local_a.json(N) | wc -l)" -eq 1

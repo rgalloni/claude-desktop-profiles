@@ -90,7 +90,7 @@ cdp launch personal             # launch, or focus if already running
 cdp color personal teal         # change the profile's color
 cdp list                        # profiles and launcher health
 cdp projects default            # Claude Code projects + sessions in a profile
-cdp transfer default personal ~/code/app [--dry-run]
+cdp transfer default personal ~/code/app [--restart] [--dry-run]
                                 # move a project's sessions to another profile
 cdp watchdog status             # LaunchAgent state + clones running off-profile
 cdp remove personal             # remove launcher; asks before touching data
@@ -117,8 +117,11 @@ always safe. If the destination already holds a different version of a
 session (for example from a manual copy), nothing is moved and the
 conflicting files are listed.
 
-Quit both profiles first: a running Claude rewrites its session list on
-exit. The destination must have opened its Code tab once, so that its
+A running Claude rewrites its session list on exit, so both profiles must be
+closed during the move. The window takes care of it: it quits whichever of
+the two is open (like ⌘Q, never force-killed), moves, and reopens it. Claude
+Code sessions running in those windows stop, but stay saved. From the
+command line, add `--restart` for the same. The destination must have opened its Code tab once, so that its
 account's session folder exists. The project folder itself stays where it
 is, because sessions point at its path.
 

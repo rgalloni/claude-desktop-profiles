@@ -252,7 +252,9 @@ final class ProfileStore: ObservableObject {
 
     func transfer(from: Profile, to: Profile, paths: [String],
                   done: @escaping (Result<String, Error>) -> Void) {
-        runCdpAsync(["transfer", from.cdpName, to.cdpName] + paths, done: done)
+        // --restart: cdp quits whichever of the two is running, moves, and
+        // reopens it, since a running Claude would overwrite the move.
+        runCdpAsync(["transfer", from.cdpName, to.cdpName] + paths + ["--restart"], done: done)
     }
 
     private func runCdpAsync(_ args: [String], done: @escaping (Result<String, Error>) -> Void) {
@@ -682,13 +684,12 @@ struct TransferSheet: View {
 
     private var source: Profile? { store.profiles.first { $0.id == sourceID } }
     private var dest: Profile? { store.profiles.first { $0.id == destID } }
-    // A running Claude keeps its session list in memory and writes it back,
-    // so cdp refuses; say so up front instead of after the click.
+    // These get quit and reopened around the move; say so before the click.
     private var runningNames: [String] {
         [source, dest].compactMap { $0 }.filter { store.running.contains($0.id) }.map(\.name)
     }
     private var canRun: Bool {
-        !selected.isEmpty && !working && runningNames.isEmpty && dest != nil && sourceID != destID
+        !selected.isEmpty && !working && dest != nil && sourceID != destID
     }
 
     var body: some View {
@@ -709,8 +710,8 @@ struct TransferSheet: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if !runningNames.isEmpty {
-                Label("Quit \(runningNames.joined(separator: " and ")) first (⌘Q).",
-                      systemImage: "exclamationmark.triangle")
+                Label("\(runningNames.joined(separator: " and ")) will quit and reopen for the move. Claude Code sessions running there stop (they stay saved).",
+                      systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
@@ -725,7 +726,7 @@ struct TransferSheet: View {
                 Spacer()
                 Button("Close") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Move") { confirmMove = true }
+                Button(runningNames.isEmpty ? "Move" : "Quit, Move & Reopen") { confirmMove = true }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
                 .disabled(!canRun)
@@ -743,10 +744,11 @@ struct TransferSheet: View {
         }
         .confirmationDialog("Move \(selected.count) project\(selected.count == 1 ? "" : "s") to “\(dest?.name ?? "")”?",
                             isPresented: $confirmMove) {
-            Button("Move", role: .destructive) { run() }
+            Button(runningNames.isEmpty ? "Move" : "Quit, Move & Reopen", role: .destructive) { run() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Their sessions leave “\(source?.name ?? "")”. Copies of the originals go to the Trash.")
+            Text("Their sessions leave “\(source?.name ?? "")”. Copies of the originals go to the Trash."
+                 + (runningNames.isEmpty ? "" : "\n\n\(runningNames.joined(separator: " and ")) will quit first and reopen afterwards."))
         }
     }
 
@@ -828,6 +830,7 @@ struct TransferSheet: View {
         let paths = projects.map(\.path).filter(selected.contains)
         store.transfer(from: source, to: dest, paths: paths) { result in
             working = false
+            store.refreshRunning()
             switch result {
             case .success(let out):
                 status = out.trimmingCharacters(in: .whitespacesAndNewlines)
