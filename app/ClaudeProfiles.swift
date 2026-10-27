@@ -240,6 +240,56 @@ final class ProfileStore: ObservableObject {
         let dir = p.dataDir ?? (appSupport + "/Claude")
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: dir)
     }
+
+    // Both run off the main thread (a big profile takes a moment to scan)
+    // and hand the outcome back on main: a Result, never errorMessage, so
+    // failures stay inside the transfer sheet that asked.
+    func loadProjects(_ p: Profile, done: @escaping (Result<[ProjectInfo], Error>) -> Void) {
+        runCdpAsync(["projects", p.cdpName]) { result in
+            done(result.map { out in out.split(separator: "\n").compactMap(ProjectInfo.init(line:)) })
+        }
+    }
+
+    func transfer(from: Profile, to: Profile, paths: [String], move: Bool,
+                  done: @escaping (Result<String, Error>) -> Void) {
+        runCdpAsync(["transfer", from.cdpName, to.cdpName] + paths + (move ? ["--move"] : []), done: done)
+    }
+
+    private func runCdpAsync(_ args: [String], done: @escaping (Result<String, Error>) -> Void) {
+        guard let cdp = cdpPath else {
+            done(.failure(NSError(domain: "cdp", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                "Bundled cdp script is missing from the app. Rebuild with: cdp gui"])))
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try runTool("/bin/zsh", [cdp] + args, env: ["CDP_FROM_CHOOSER": "1"]) }
+            DispatchQueue.main.async { done(result) }
+        }
+    }
+}
+
+// One row of `cdp projects`: path<TAB>sessions<TAB>last activity (epoch s)<TAB>titles.
+struct ProjectInfo: Identifiable, Hashable {
+    let path: String
+    let sessions: Int
+    let lastActivity: Date
+    let titles: String
+    var id: String { path }
+    var name: String { (path as NSString).lastPathComponent }
+
+    init?(line: Substring) {
+        let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+        guard f.count >= 3, let n = Int(f[1]), let t = Double(f[2]) else { return nil }
+        path = f[0]
+        sessions = n
+        lastActivity = Date(timeIntervalSince1970: t)
+        titles = f.count > 3 ? f[3] : ""
+    }
+}
+
+extension Profile {
+    // The name `cdp` resolves: it slugifies profile names, "default" is the main install.
+    var cdpName: String { isDefault ? "default" : name }
 }
 
 // MARK: - App
@@ -261,6 +311,7 @@ struct ContentView: View {
     @State private var showAdd = false
     @State private var removing: Profile?
     @State private var confirmWipe: Profile?
+    @State private var transferSource: Profile?
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     private let columns = [GridItem(.adaptive(minimum: 150, maximum: 180), spacing: 14)]
@@ -278,6 +329,7 @@ struct ContentView: View {
                             isRunning: store.running.contains(p.id),
                             launch: { store.launch(p) },
                             reveal: { store.revealData(p) },
+                            transfer: store.profiles.count > 1 ? { transferSource = p } : nil,
                             setColor: p.isDefault ? nil : { store.setColor(p, color: $0) },
                             remove: p.isDefault ? nil : { removing = p }
                         )
@@ -293,6 +345,9 @@ struct ContentView: View {
         .onReceive(timer) { _ in store.refreshRunning() }
         .sheet(isPresented: $showAdd) {
             AddSheet { name, color in store.add(name, color: color) }
+        }
+        .sheet(item: $transferSource) { p in
+            TransferSheet(store: store, initialSource: p)
         }
         .confirmationDialog(
             "Remove “\(removing?.name ?? "")”?",
@@ -340,6 +395,13 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Button {
+                transferSource = store.profiles.first
+            } label: {
+                Label("Transfer Projects…", systemImage: "arrow.left.arrow.right")
+            }
+            .controlSize(.large)
+            .disabled(store.profiles.count < 2)
             Button {
                 showAdd = true
             } label: {
@@ -406,6 +468,7 @@ struct ProfileCard: View {
     let isRunning: Bool
     let launch: () -> Void
     let reveal: () -> Void
+    let transfer: (() -> Void)?
     let setColor: ((String) -> Void)?
     let remove: (() -> Void)?
     @State private var hovering = false
@@ -485,6 +548,9 @@ struct ProfileCard: View {
     private var cardActions: some View {
         Button("Launch") { launch() }
         Button("Reveal Data Folder in Finder") { reveal() }
+        if let transfer {
+            Button("Transfer Projects…") { transfer() }
+        }
         if let setColor {
             Menu("Change Color") {
                 ForEach(ProfileColor.all) { c in
@@ -590,5 +656,198 @@ struct AddSheet: View {
         guard !n.isEmpty else { return }
         create(n, colorName)
         dismiss()
+    }
+}
+
+// Picks a source and destination profile and the source's projects to copy
+// or move. All the work is `cdp transfer`; this only builds its arguments.
+struct TransferSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var store: ProfileStore
+    @State private var sourceID: String
+    @State private var destID: String
+    @State private var projects: [ProjectInfo] = []
+    @State private var selected: Set<String> = []
+    @State private var move = false
+    @State private var loading = false
+    @State private var working = false
+    @State private var status: String?
+    @State private var failure: String?
+    @State private var confirmMove = false
+
+    init(store: ProfileStore, initialSource: Profile) {
+        self.store = store
+        _sourceID = State(initialValue: initialSource.id)
+        _destID = State(initialValue: store.profiles.first { $0.id != initialSource.id }?.id ?? "")
+    }
+
+    private var source: Profile? { store.profiles.first { $0.id == sourceID } }
+    private var dest: Profile? { store.profiles.first { $0.id == destID } }
+    // A running Claude keeps its session list in memory and writes it back,
+    // so cdp refuses; say so up front instead of after the click.
+    private var runningNames: [String] {
+        [source, dest].compactMap { $0 }.filter { store.running.contains($0.id) }.map(\.name)
+    }
+    private var canRun: Bool {
+        !selected.isEmpty && !working && runningNames.isEmpty && dest != nil && sourceID != destID
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Transfer projects").font(.title3.bold())
+            HStack(spacing: 10) {
+                Picker("From", selection: $sourceID) {
+                    ForEach(store.profiles) { Text($0.name).tag($0.id) }
+                }
+                Image(systemName: "arrow.right").foregroundStyle(.secondary)
+                Picker("To", selection: $destID) {
+                    ForEach(store.profiles.filter { $0.id != sourceID }) { Text($0.name).tag($0.id) }
+                }
+            }
+            projectList
+            HStack(spacing: 10) {
+                Picker("", selection: $move) {
+                    Text("Copy").tag(false)
+                    Text("Move").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 160)
+                Text(move ? "Removes them from “\(source?.name ?? "")” once they've arrived (into the Trash)."
+                          : "They stay in “\(source?.name ?? "")” too.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !runningNames.isEmpty {
+                Label("Quit \(runningNames.joined(separator: " and ")) first (⌘Q).",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if let status {
+                Text(status).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            if let failure {
+                Text(failure).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+            }
+            HStack {
+                if working { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Close") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button(move ? "Move" : "Copy") {
+                    if move { confirmMove = true } else { run() }
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .disabled(!canRun)
+            }
+        }
+        .padding(20)
+        .frame(width: 540)
+        .onAppear { reload(clearSelection: true) }
+        .onChange(of: sourceID) { _ in
+            if destID == sourceID || dest == nil {
+                destID = store.profiles.first { $0.id != sourceID }?.id ?? ""
+            }
+            status = nil
+            reload(clearSelection: true)
+        }
+        .confirmationDialog("Move \(selected.count) project\(selected.count == 1 ? "" : "s") to “\(dest?.name ?? "")”?",
+                            isPresented: $confirmMove) {
+            Button("Move", role: .destructive) { run() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Their sessions leave “\(source?.name ?? "")”. Copies of the originals go to the Trash.")
+        }
+    }
+
+    private var projectList: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(loading ? "Loading…" : "\(projects.count) project\(projects.count == 1 ? "" : "s"), \(selected.count) selected")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(allSelected ? "Select None" : "Select All") {
+                    selected = allSelected ? [] : Set(projects.map(\.path))
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+                .disabled(projects.isEmpty)
+            }
+            List(projects) { p in
+                Toggle(isOn: Binding(get: { selected.contains(p.path) },
+                                     set: { if $0 { selected.insert(p.path) } else { selected.remove(p.path) } })) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(p.name).font(.headline)
+                        Text(p.path)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(detail(p))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    .padding(.vertical, 2)
+                }
+                .toggleStyle(.checkbox)
+            }
+            .frame(height: 300)
+            .overlay {
+                if !loading && projects.isEmpty {
+                    Text("No Claude Code sessions in this profile.").foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private var allSelected: Bool { !projects.isEmpty && selected.count == projects.count }
+
+    private func detail(_ p: ProjectInfo) -> String {
+        let when = p.lastActivity.formatted(date: .abbreviated, time: .shortened)
+        let head = "\(p.sessions) session\(p.sessions == 1 ? "" : "s") · \(when)"
+        return p.titles.isEmpty ? head : "\(head) · \(p.titles)"
+    }
+
+    private func reload(clearSelection: Bool) {
+        guard let source else { return }
+        loading = true
+        failure = nil
+        if clearSelection { selected = [] }
+        store.loadProjects(source) { result in
+            // A newer reload (source changed meanwhile) owns the list now.
+            guard source.id == sourceID else { return }
+            loading = false
+            switch result {
+            case .success(let list):
+                projects = list
+                selected = selected.intersection(list.map(\.path))
+            case .failure(let e):
+                projects = []
+                failure = e.localizedDescription
+            }
+        }
+    }
+
+    private func run() {
+        guard let source, let dest else { return }
+        working = true
+        status = nil
+        failure = nil
+        let paths = projects.map(\.path).filter(selected.contains)
+        store.transfer(from: source, to: dest, paths: paths, move: move) { result in
+            working = false
+            switch result {
+            case .success(let out):
+                status = out.trimmingCharacters(in: .whitespacesAndNewlines)
+                if move { reload(clearSelection: true) }
+            case .failure(let e):
+                failure = e.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
     }
 }

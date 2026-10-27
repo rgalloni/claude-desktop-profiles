@@ -25,7 +25,7 @@ set -euo pipefail
 # (FUNCTION_ARGZERO), which would break the self-copy into the chooser bundle.
 SCRIPT_PATH="${0:A}"
 
-CDP_VERSION="0.4.2"
+CDP_VERSION="0.5.0"
 
 APP_SUPPORT="$HOME/Library/Application Support"
 LAUNCHER_DIR="$HOME/Applications"
@@ -1231,7 +1231,8 @@ cmd_transfer() {
       mv -f "$tmp" "$dest"
     done
   elif (( ${#metas} )); then
-    warn "'$to' has no Desktop session folder yet, so these sessions won't show in its sidebar: open its Code tab once, then run this again. Transcripts were copied (claude --resume finds them)."
+    # stdout, not warn: the GUI only shows a successful run's stdout.
+    print -- "⚠ '$to' has no Desktop session folder yet, so these sessions won't show in its sidebar: open its Code tab once, then run this again. Transcripts were copied (claude --resume finds them)."
   fi
   ok "${verb/%y/ie}d ${#ids} transcript(s) to '$to'."
 

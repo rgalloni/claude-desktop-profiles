@@ -89,6 +89,9 @@ cdp add personal --color blue   # create profile + Spotlight launcher
 cdp launch personal             # launch, or focus if already running
 cdp color personal teal         # change the profile's color
 cdp list                        # profiles and launcher health
+cdp projects default            # Claude Code projects + sessions in a profile
+cdp transfer default personal ~/code/app [--move] [--dry-run]
+                                # copy (or move) a project's sessions to another profile
 cdp watchdog status             # LaunchAgent state + clones running off-profile
 cdp remove personal             # remove launcher; asks before touching data
 cdp setup                       # point launchers + watchdog at this cdp
@@ -96,6 +99,21 @@ cdp version
 ```
 
 The window, the launchers and the CLI all run the same `cdp` script.
+
+### Moving projects between profiles
+
+**Transfer Projects…** in the window (or `cdp transfer`) copies the Claude
+Code sessions of the projects you tick from one profile to another: their
+transcripts, their `/rewind` history and their Code-tab sidebar entries.
+Sessions in a project's `.claude/worktrees/*` go with it. Sidebar fields that
+belong to the source account (Remote Control bridges, its connectors, its
+published artifacts) are dropped. **Move** removes the sessions from the
+source only after checking they arrived, and puts them in the Trash.
+
+Quit both profiles first: a running Claude rewrites its session list on
+exit. The destination must have opened its Code tab once, so that its
+account's session folder exists. The project folder itself stays where it
+is, because sessions point at its path.
 
 ## Data and privacy
 
@@ -227,6 +245,7 @@ AppleScript picker without a Swift toolchain) and links `cdp` onto your PATH.
 scripts/build.sh   # build/Claude Profiles.app and build/Claude-Profiles.zip (universal)
 scripts/test.sh    # builds, checks the bundle, then runs the first-launch setup
                    # of a quarantined copy in a throwaway HOME
+scripts/test-transfer.sh   # cdp projects / cdp transfer on fake profiles
 ```
 
 The tests never touch your real `~/Applications`, profiles or watchdog.
