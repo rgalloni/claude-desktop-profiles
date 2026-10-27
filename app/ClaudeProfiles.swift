@@ -250,9 +250,9 @@ final class ProfileStore: ObservableObject {
         }
     }
 
-    func transfer(from: Profile, to: Profile, paths: [String], move: Bool,
+    func transfer(from: Profile, to: Profile, paths: [String],
                   done: @escaping (Result<String, Error>) -> Void) {
-        runCdpAsync(["transfer", from.cdpName, to.cdpName] + paths + (move ? ["--move"] : []), done: done)
+        runCdpAsync(["transfer", from.cdpName, to.cdpName] + paths, done: done)
     }
 
     private func runCdpAsync(_ args: [String], done: @escaping (Result<String, Error>) -> Void) {
@@ -659,8 +659,8 @@ struct AddSheet: View {
     }
 }
 
-// Picks a source and destination profile and the source's projects to copy
-// or move. All the work is `cdp transfer`; this only builds its arguments.
+// Picks a source and destination profile and the source's projects to move.
+// All the work is `cdp transfer`; this only builds its arguments.
 struct TransferSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: ProfileStore
@@ -668,7 +668,6 @@ struct TransferSheet: View {
     @State private var destID: String
     @State private var projects: [ProjectInfo] = []
     @State private var selected: Set<String> = []
-    @State private var move = false
     @State private var loading = false
     @State private var working = false
     @State private var status: String?
@@ -705,20 +704,10 @@ struct TransferSheet: View {
                 }
             }
             projectList
-            HStack(spacing: 10) {
-                Picker("", selection: $move) {
-                    Text("Copy").tag(false)
-                    Text("Move").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 160)
-                Text(move ? "Removes them from “\(source?.name ?? "")” once they've arrived (into the Trash)."
-                          : "They stay in “\(source?.name ?? "")” too.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Text("Sessions move: they leave “\(source?.name ?? "")” once they've arrived (the originals go to the Trash), so each one only ever lives in one profile.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             if !runningNames.isEmpty {
                 Label("Quit \(runningNames.joined(separator: " and ")) first (⌘Q).",
                       systemImage: "exclamationmark.triangle")
@@ -736,9 +725,7 @@ struct TransferSheet: View {
                 Spacer()
                 Button("Close") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button(move ? "Move" : "Copy") {
-                    if move { confirmMove = true } else { run() }
-                }
+                Button("Move") { confirmMove = true }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
                 .disabled(!canRun)
@@ -839,12 +826,12 @@ struct TransferSheet: View {
         status = nil
         failure = nil
         let paths = projects.map(\.path).filter(selected.contains)
-        store.transfer(from: source, to: dest, paths: paths, move: move) { result in
+        store.transfer(from: source, to: dest, paths: paths) { result in
             working = false
             switch result {
             case .success(let out):
                 status = out.trimmingCharacters(in: .whitespacesAndNewlines)
-                if move { reload(clearSelection: true) }
+                reload(clearSelection: true)
             case .failure(let e):
                 failure = e.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
             }

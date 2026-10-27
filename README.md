@@ -90,8 +90,8 @@ cdp launch personal             # launch, or focus if already running
 cdp color personal teal         # change the profile's color
 cdp list                        # profiles and launcher health
 cdp projects default            # Claude Code projects + sessions in a profile
-cdp transfer default personal ~/code/app [--move] [--dry-run]
-                                # copy (or move) a project's sessions to another profile
+cdp transfer default personal ~/code/app [--dry-run]
+                                # move a project's sessions to another profile
 cdp watchdog status             # LaunchAgent state + clones running off-profile
 cdp remove personal             # remove launcher; asks before touching data
 cdp setup                       # point launchers + watchdog at this cdp
@@ -102,13 +102,20 @@ The window, the launchers and the CLI all run the same `cdp` script.
 
 ### Moving projects between profiles
 
-**Transfer Projects…** in the window (or `cdp transfer`) copies the Claude
+**Transfer Projects…** in the window (or `cdp transfer`) moves the Claude
 Code sessions of the projects you tick from one profile to another: their
 transcripts, their `/rewind` history and their Code-tab sidebar entries.
 Sessions in a project's `.claude/worktrees/*` go with it. Sidebar fields that
 belong to the source account (Remote Control bridges, its connectors, its
-published artifacts) are dropped. **Move** removes the sessions from the
-source only after checking they arrived, and puts them in the Trash.
+published artifacts) are dropped. The sessions leave the source only after
+checking they arrived, and the originals go to the Trash.
+
+There is deliberately no copy. A copied session could be continued in both
+profiles, and copying it back would silently drop one side's turns. Moving
+keeps each session in exactly one profile, so moving it back and forth is
+always safe. If the destination already holds a different version of a
+session (for example from a manual copy), nothing is moved and the
+conflicting files are listed.
 
 Quit both profiles first: a running Claude rewrites its session list on
 exit. The destination must have opened its Code tab once, so that its

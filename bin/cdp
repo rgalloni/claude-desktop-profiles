@@ -25,7 +25,7 @@ set -euo pipefail
 # (FUNCTION_ARGZERO), which would break the self-copy into the chooser bundle.
 SCRIPT_PATH="${0:A}"
 
-CDP_VERSION="0.5.0"
+CDP_VERSION="0.5.1"
 
 APP_SUPPORT="$HOME/Library/Application Support"
 LAUNCHER_DIR="$HOME/Applications"
@@ -1141,30 +1141,33 @@ cmd_projects() {
   fi
 }
 
-# rsync that never replaces a newer destination file.
-sync_tree() {
-  mkdir -p "$2"
-  rsync -a --update -- "$1/" "$2/"
+# Lists files that exist on both sides with different content: a session
+# continued in both profiles. Those are never overwritten.
+tree_conflicts() {
+  [[ -d "$2" ]] || return 0
+  rsync -a --dry-run --checksum --existing --out-format='%n' -- "$1/" "$2/" | grep -v '/$' || true
 }
 
-# True when a repeat sync would change nothing: every source file made it.
+# True when every source file is in the destination with the same content.
 tree_synced() {
-  [[ -z "$(rsync -a --update --dry-run --itemize-changes -- "$1/" "$2/")" ]]
+  [[ -z "$(rsync -a --dry-run --checksum --out-format='%n' -- "$1/" "$2/" | grep -v '/$')" ]]
 }
 
+# Moves, never copies: a session lives in exactly one profile, so it can't
+# be continued in two and then silently lose one side's turns on the way back.
 cmd_transfer() {
-  local move=0 force=0 dry=0 a
+  local force=0 dry=0 a
   local -a pos
   for a in "$@"; do
     case "$a" in
-      --move)    move=1 ;;
+      --move)    ;;  # the only mode; accepted for old scripts
       --force)   force=1 ;;
       --dry-run) dry=1 ;;
       -*)        err "Unknown option $a" ;;
       *)         pos+=("${a%/}") ;;
     esac
   done
-  (( ${#pos} >= 3 )) || err "Usage: cdp transfer <from> <to> <project-path>... [--move] [--dry-run] [--force]"
+  (( ${#pos} >= 3 )) || err "Usage: cdp transfer <from> <to> <project-path>... [--dry-run] [--force]"
   local from="${pos[1]}" to="${pos[2]}"
   local src_data dst_data src_cfg dst_cfg
   src_data=$(profile_data_dir "$from")
@@ -1198,56 +1201,73 @@ cmd_transfer() {
   (( ${#dirs} + ${#metas} )) || err "No sessions found in '$from' for: ${(j:, :)${pos[@]:2}}"
 
   # Sidebar entries go to the destination account's folder; with several
-  # (sign-ins over time), the most recently used one.
+  # (sign-ins over time), the most recently used one. Without one they'd be
+  # lost from the sidebar, so refuse rather than move half a session.
   local -a dst_session_dirs=("$dst_data"/claude-code-sessions/*/*(N/om))
   local dst_meta="${dst_session_dirs[1]:-}"
+  (( ${#metas} == 0 )) || [[ -n "$dst_meta" ]] ||
+    err "'$to' has no Desktop session folder yet: open its Code tab once (signed in), quit it, then try again."
 
-  local verb=Copy
-  (( move )) && verb=Move
-  info "$verb from '$from' to '$to': ${#ids} transcript(s), ${#metas} sidebar entr$( (( ${#metas} == 1 )) && print y || print ies)."
+  # Pairs of source/destination trees, transcripts plus /rewind history.
+  local -a pairs
+  local id sub
+  for k in "${dirs[@]}"; do pairs+=("$k" "$dst_cfg/projects/${k:t}"); done
+  for id in "${ids[@]}"; do
+    for sub in file-history session-env; do
+      [[ -d "$src_cfg/$sub/$id" ]] && pairs+=("$src_cfg/$sub/$id" "$dst_cfg/$sub/$id")
+    done
+  done
+
+  local -a conflicts
+  local s d c
+  for s d in "${pairs[@]}"; do
+    for c in ${(f)"$(tree_conflicts "$s" "$d")"}; do conflicts+=("${d:t}/$c"); done
+  done
+  if (( ${#conflicts} )); then
+    print -u2 -- "✗ '$to' already has different versions of these files (a session continued in both profiles):"
+    print -u2 -l -- "    ${^conflicts[@]}"
+    err "Nothing moved. Keep one side: move the other profile's copy of that session to the Trash, then try again."
+  fi
+
+  info "Move from '$from' to '$to': ${#ids} transcript(s), ${#metas} sidebar entr$( (( ${#metas} == 1 )) && print y || print ies)."
   if (( dry )); then
     for k in "${dirs[@]}"; do print -r -- "  transcripts  ${k:t}"; done
     for k in "${metas[@]}"; do print -r -- "  sidebar      ${meta_title[$k]:-${k:t}}"; done
-    [[ -n "$dst_meta" ]] || warn "'$to' has no Desktop session folder yet: open its Code tab once first."
     return 0
   fi
 
-  local id sub
-  for k in "${dirs[@]}"; do sync_tree "$k" "$dst_cfg/projects/${k:t}"; done
-  for id in "${ids[@]}"; do
-    for sub in file-history session-env; do
-      [[ -d "$src_cfg/$sub/$id" ]] && sync_tree "$src_cfg/$sub/$id" "$dst_cfg/$sub/$id"
-    done
+  for s d in "${pairs[@]}"; do
+    mkdir -p "$d"
+    rsync -a -- "$s/" "$d/"
   done
-
+  # A sidebar entry already in the destination (an older transfer) is
+  # replaced where it is, so it never shows twice.
   local dest tmp
-  if [[ -n "$dst_meta" ]]; then
-    for k in "${metas[@]}"; do
-      dest="$dst_meta/${k:t}"
-      [[ -e "$dest" && "$dest" -nt "$k" ]] && continue
-      tmp="$dest.cdp-tmp"
-      cp -p "$k" "$tmp"
-      for a in "${SESSION_ACCOUNT_KEYS[@]}"; do plutil -remove "$a" "$tmp" >/dev/null 2>&1 || true; done
-      mv -f "$tmp" "$dest"
-    done
-  elif (( ${#metas} )); then
-    # stdout, not warn: the GUI only shows a successful run's stdout.
-    print -- "⚠ '$to' has no Desktop session folder yet, so these sessions won't show in its sidebar: open its Code tab once, then run this again. Transcripts were copied (claude --resume finds them)."
-  fi
-  ok "${verb/%y/ie}d ${#ids} transcript(s) to '$to'."
-
-  (( move )) || return 0
-  # Delete from the source only what verifiably arrived; "deleted" means
-  # moved to the Trash, so a bad move is one drag away from undone.
-  local trash="$HOME/.Trash/cdp-transfer-$(date +%Y%m%d-%H%M%S)"
-  for k in "${dirs[@]}"; do
-    tree_synced "$k" "$dst_cfg/projects/${k:t}" || err "Copy of ${k:t} is incomplete; source left untouched."
-  done
-  [[ -n "$dst_meta" ]] || err "Sidebar entries were not copied; source left untouched."
+  local -a existing
   for k in "${metas[@]}"; do
-    cmp -s <(plutil -extract cliSessionId raw "$k") <(plutil -extract cliSessionId raw "$dst_meta/${k:t}") ||
+    existing=("$dst_data"/claude-code-sessions/*/*/"${k:t}"(N))
+    dest="${existing[1]:-$dst_meta/${k:t}}"
+    tmp="$dest.cdp-tmp"
+    cp -p "$k" "$tmp"
+    for a in "${SESSION_ACCOUNT_KEYS[@]}"; do plutil -remove "$a" "$tmp" >/dev/null 2>&1 || true; done
+    mv -f "$tmp" "$dest"
+  done
+
+  # Remove from the source only what verifiably arrived; "remove" means
+  # into the Trash, so a bad move is one drag away from undone.
+  for s d in "${pairs[@]}"; do
+    tree_synced "$s" "$d" || err "Copy of ${s:t} is incomplete; source left untouched."
+  done
+  for k in "${metas[@]}"; do
+    existing=("$dst_data"/claude-code-sessions/*/*/"${k:t}"(N))
+    [[ -n "${existing[1]:-}" ]] &&
+      [[ "$(plutil -extract cliSessionId raw "$k" 2>/dev/null)" == "$(plutil -extract cliSessionId raw "${existing[1]}" 2>/dev/null)" ]] ||
       err "Sidebar entry ${k:t} did not arrive; source left untouched."
   done
+  # Unique per run: two moves in the same second must not share a folder.
+  mkdir -p "$HOME/.Trash"
+  local trash
+  trash=$(mktemp -d "$HOME/.Trash/cdp-transfer-$(date +%Y%m%d-%H%M%S)-XXXX")
   mkdir -p "$trash/projects" "$trash/sidebar"
   for k in "${dirs[@]}"; do mv -- "$k" "$trash/projects/"; done
   for id in "${ids[@]}"; do
@@ -1256,7 +1276,7 @@ cmd_transfer() {
     done
   done
   for k in "${metas[@]}"; do mv -- "$k" "$trash/sidebar/"; done
-  ok "Removed them from '$from' (kept in the Trash: ${trash:t})."
+  ok "Moved ${#ids} transcript(s) to '$to'; the originals are in the Trash (${trash:t})."
 }
 
 cmd_remove() {
@@ -1320,11 +1340,12 @@ USAGE
   cdp projects <profile>
                       List a profile's Claude Code projects and sessions
                       ("default" is your main install)
-  cdp transfer <from> <to> <project-path>... [--move] [--dry-run]
-                      Copy those projects' sessions (transcripts, /rewind
-                      history, sidebar entries) to another profile; --move
-                      also removes them from <from> (into the Trash). Both
-                      profiles must be quit (or pass --force)
+  cdp transfer <from> <to> <project-path>... [--dry-run]
+                      Move those projects' sessions (transcripts, /rewind
+                      history, sidebar entries) to another profile; the
+                      originals go to the Trash. Refuses sessions that
+                      differ on both sides. Both profiles must be quit
+                      (or pass --force)
   cdp remove <name>   Remove a profile's launcher; add --keep-data or
                       --delete-data to skip the interactive question
   cdp gui             Build + install the "Claude Profiles" SwiftUI app
