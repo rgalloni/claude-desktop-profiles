@@ -25,7 +25,7 @@ set -euo pipefail
 # (FUNCTION_ARGZERO), which would break the self-copy into the chooser bundle.
 SCRIPT_PATH="${0:A}"
 
-CDP_VERSION="0.5.2"
+CDP_VERSION="0.5.3"
 
 APP_SUPPORT="$HOME/Library/Application Support"
 LAUNCHER_DIR="$HOME/Applications"
@@ -1012,6 +1012,10 @@ cmd_list() {
 
 # Sidebar entry fields that point at the source account (Remote Control
 # bridges, its connectors, its published artifacts); dropped on transfer.
+# Where moved sessions' originals are kept, and the log of every transfer.
+TRANSFER_BACKUPS="$APP_SUPPORT/claude-desktop-profiles/moved"
+TRANSFER_LOG="$HOME/Library/Logs/claude-desktop-profiles/transfer.log"
+
 SESSION_ACCOUNT_KEYS=(bridgeSessionIds remoteMcpServersConfig enabledMcpTools publishedArtifacts steeredByRemoteClient)
 
 # Reads every sidebar entry in one osascript instead of a plutil per field:
@@ -1070,7 +1074,7 @@ quit_profile() {
   pid=$(profile_pid "$1")
   [[ -n "$pid" ]] || return 0
   tool=$(ensure_tint_tool) || err "The helper app is missing; quit the profile by hand (Cmd+Q)."
-  "$tool" quit "$pid" 2>/dev/null || return 1
+  "$tool" quit "$pid" 2>/dev/null || return 2
   for i in {1..120}; do
     kill -0 "$pid" 2>/dev/null || return 0
     sleep 0.5
@@ -1103,8 +1107,12 @@ transcript_cwd() {
 # Fills the CALLER's assoc arrays (zsh scoping is dynamic): dir_root
 # (transcript dir → project), meta_root / meta_id / meta_last / meta_title
 # (sidebar entry file → project, session id, last activity ms, title).
+# Sidebar entries whose transcript is gone (Claude Code deletes old ones)
+# are skipped: they can't be resumed, and Desktop drops them on launch.
 scan_profile_sessions() {
-  local data_dir="$1" cfg="$2" scratch="$1/scratch-workspaces/" d root
+  local data_dir="$1" cfg="$2" scratch="$1/scratch-workspaces/" d root f
+  local -A transcript
+  for f in "$cfg"/projects/*/*.jsonl(N); do transcript[${f:t:r}]=1; done
   for d in "$cfg"/projects/*(N/); do
     root=$(transcript_cwd "$d") || continue
     root=${root%%/.claude/worktrees/*}
@@ -1113,9 +1121,9 @@ scan_profile_sessions() {
   done
   local -a files=("$data_dir"/claude-code-sessions/*/*/local_*.json(N))
   (( ${#files} )) || return 0
-  local f cwd id last title
+  local cwd id last title
   while IFS=$'\x1f' read -r f cwd id last title; do
-    [[ -n "$cwd" ]] || continue
+    [[ -n "$cwd" && -n "${transcript[$id]:-}" ]] || continue
     root=${cwd%%/.claude/worktrees/*}
     [[ "$root/" == "$scratch"* ]] && continue
     meta_root[$f]=$root
@@ -1195,6 +1203,9 @@ tree_synced() {
 # be continued in two and then silently lose one side's turns on the way back.
 # --restart quits whichever of the two is running, moves, and reopens them.
 cmd_transfer() {
+  mkdir -p "${TRANSFER_LOG:h}"
+  print -r -- "---- $(date '+%Y-%m-%d %H:%M:%S') cdp transfer ${(q-)@}" >> "$TRANSFER_LOG"
+  exec > >(tee -a "$TRANSFER_LOG") 2> >(tee -a "$TRANSFER_LOG" >&2)
   local force=0 dry=0 restart=0 a
   local -a pos
   for a in "$@"; do
@@ -1222,15 +1233,22 @@ cmd_transfer() {
   for name dir in "$from" "$src_data" "$to" "$dst_data"; do
     profile_is_running "$dir" || continue
     info "Quitting '$name'…"
-    if ! quit_profile "$dir"; then
-      print -u2 -- "✗ '$name' didn't quit within a minute (is it asking something?). Nothing moved."
+    quit_profile "$dir" || {
+      (( $? == 2 )) && print -u2 -- "✗ Couldn't ask '$name' to quit. Nothing moved." ||
+        print -u2 -- "✗ '$name' didn't quit within a minute (is it asking something?). Nothing moved."
       rc=1
       break
-    fi
+    }
     reopen+=("$dir")
   done
-  # A subshell, so a failed move (err exits) still reopens what we quit.
-  (( rc )) || ( transfer_sessions ) || rc=$?
+  # A subshell, so a failed move still reopens what we quit. Not on the left
+  # of `||`: zsh turns ERR_EXIT off there, and a failed step would go on to
+  # report success.
+  if (( ! rc )); then
+    setopt local_options no_err_exit
+    ( setopt err_exit; transfer_sessions )
+    rc=$?
+  fi
   for dir in "${reopen[@]}"; do reopen_profile "$dir" || rc=1; done
   (( ${#reopen} )) && info "Reopened ${#reopen} profile(s)."
   return $rc
@@ -1289,7 +1307,7 @@ transfer_sessions() {
   if (( ${#conflicts} )); then
     print -u2 -- "✗ '$to' already has different versions of these files (a session continued in both profiles):"
     print -u2 -l -- "    ${^conflicts[@]}"
-    err "Nothing moved. Keep one side: move the other profile's copy of that session to the Trash, then try again."
+    err "Nothing moved. Keep one side: move the other profile's copy of that session out of its folder, then try again."
   fi
 
   info "Move from '$from' to '$to': ${#ids} transcript(s), ${#metas} sidebar entr$( (( ${#metas} == 1 )) && print y || print ies)."
@@ -1316,8 +1334,9 @@ transfer_sessions() {
     mv -f "$tmp" "$dest"
   done
 
-  # Remove from the source only what verifiably arrived; "remove" means
-  # into the Trash, so a bad move is one drag away from undone.
+  # Remove from the source only what verifiably arrived. "Remove" means into
+  # a backup folder, not the Trash: macOS can deny an app's child process
+  # access to ~/.Trash, and the originals must never just vanish.
   for s d in "${pairs[@]}"; do
     tree_synced "$s" "$d" || err "Copy of ${s:t} is incomplete; source left untouched."
   done
@@ -1328,9 +1347,9 @@ transfer_sessions() {
       err "Sidebar entry ${k:t} did not arrive; source left untouched."
   done
   # Unique per run: two moves in the same second must not share a folder.
-  mkdir -p "$HOME/.Trash"
+  mkdir -p "$TRANSFER_BACKUPS"
   local trash
-  trash=$(mktemp -d "$HOME/.Trash/cdp-transfer-$(date +%Y%m%d-%H%M%S)-XXXX")
+  trash=$(mktemp -d "$TRANSFER_BACKUPS/$(date +%Y%m%d-%H%M%S)-${${from// /-}:l}-to-${${to// /-}:l}-XXXX")
   mkdir -p "$trash/projects" "$trash/sidebar"
   for k in "${dirs[@]}"; do mv -- "$k" "$trash/projects/"; done
   for id in "${ids[@]}"; do
@@ -1339,7 +1358,7 @@ transfer_sessions() {
     done
   done
   for k in "${metas[@]}"; do mv -- "$k" "$trash/sidebar/"; done
-  ok "Moved ${#ids} transcript(s) to '$to'; the originals are in the Trash (${trash:t})."
+  ok "Moved ${#ids} transcript(s) and ${#metas} sidebar entr$( (( ${#metas} == 1 )) && print y || print ies) to '$to'. Originals kept in: $trash"
 }
 
 cmd_remove() {
@@ -1406,7 +1425,8 @@ USAGE
   cdp transfer <from> <to> <project-path>... [--restart] [--dry-run]
                       Move those projects' sessions (transcripts, /rewind
                       history, sidebar entries) to another profile; the
-                      originals go to the Trash. Refuses sessions that
+                      originals are kept in Application Support/claude-
+                      desktop-profiles/moved. Refuses sessions that
                       differ on both sides. Both profiles must be quit;
                       --restart quits the running ones and reopens them
   cdp remove <name>   Remove a profile's launcher; add --keep-data or

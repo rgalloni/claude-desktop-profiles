@@ -39,12 +39,17 @@ print -r -- '{"sessionId":"local_a","cliSessionId":"s1","cwd":"/x/proj","lastAct
   > "$A/claude-code-sessions/acct/org/local_a.json"
 print -r -- '{"sessionId":"local_c","cliSessionId":"s3","cwd":"/y/other","lastActivityAt":1600000000000,"title":"Other"}' \
   > "$A/claude-code-sessions/acct/org/local_c.json"
+# A sidebar entry whose transcript Claude Code already deleted.
+print -r -- '{"sessionId":"local_z","cliSessionId":"gone","cwd":"/z/expired","lastActivityAt":1500000000000,"title":"Old"}' \
+  > "$A/claude-code-sessions/acct/org/local_z.json"
 
 out=$(cdp projects alpha)
 check "projects lists /x/proj with both sessions" grep -qxF $'/x/proj\t2\t1700000000\tFix bug' <<<"$out"
 check "projects lists /y/other" grep -q $'^/y/other\t1\t' <<<"$out"
 check "projects sorts newest first" test "${${(f)out}[1]%%$'\t'*}" = /x/proj
 check "unknown profile fails" not cdp projects nope
+check "expired session not listed" not grep -q /z/expired <<<"$out"
+check "expired session not moved" not cdp transfer alpha beta /z/expired
 check "dry run succeeds" cdp transfer alpha beta /x/proj --dry-run
 check "dry run moves nothing" test ! -e "$B/claude-config"
 check "unknown project fails" not cdp transfer alpha beta /nope
@@ -63,7 +68,8 @@ check "account-bound fields dropped" not grep -qE 'bridgeSessionIds|enabledMcpTo
 check "source transcript removed" test ! -e "$A/claude-config/projects/-x-proj"
 check "source rewind history removed" test ! -e "$A/claude-config/file-history/s1"
 check "source sidebar entry removed" test ! -e "$A/claude-code-sessions/acct/org/local_a.json"
-check "originals kept in the Trash" test -f "$sandbox"/.Trash/cdp-transfer-*/sidebar/local_a.json(N[1])
+check "originals kept in the backup folder" test -f "$AS"/claude-desktop-profiles/moved/*-alpha-to-beta-*/sidebar/local_a.json(N[1])
+check "transfer is logged" grep -q 'cdp transfer alpha beta' "$sandbox/Library/Logs/claude-desktop-profiles/transfer.log"
 check "other project left alone" test -f "$A/claude-config/projects/-y-other/s3.jsonl"
 
 # Continued in Beta, then moved back: Alpha gets the newer turns, once.
@@ -80,5 +86,12 @@ print -r -- '{"type":"user","cwd":"/x/proj","sessionId":"s1","other":"branch"}' 
 check "diverged session refused" not cdp transfer alpha beta /x/proj
 check "refusal keeps the source" test -f "$A/claude-config/projects/-x-proj/s1.jsonl"
 check "refusal keeps the destination's version" grep -q branch "$B/claude-config/projects/-x-proj/s1.jsonl"
+
+# A step failing mid-move (--restart path) must report failure, not success.
+rm -f "$B/claude-config/projects/-x-proj/s1.jsonl"
+chmod 500 "$A/claude-code-sessions/acct/org"
+check "--restart reports a failed step" not cdp transfer alpha beta /x/proj --restart
+chmod 700 "$A/claude-code-sessions/acct/org"
+check "failed move keeps the source" test -f "$A/claude-code-sessions/acct/org/local_a.json"
 
 (( fails == 0 )) && print -- "all passed" || { print -- "$fails failed"; exit 1 }

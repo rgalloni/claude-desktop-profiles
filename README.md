@@ -108,7 +108,11 @@ transcripts, their `/rewind` history and their Code-tab sidebar entries.
 Sessions in a project's `.claude/worktrees/*` go with it. Sidebar fields that
 belong to the source account (Remote Control bridges, its connectors, its
 published artifacts) are dropped. The sessions leave the source only after
-checking they arrived, and the originals go to the Trash.
+checking they arrived, and the originals are kept in
+`~/Library/Application Support/claude-desktop-profiles/moved`. Every transfer
+is logged to `~/Library/Logs/claude-desktop-profiles/transfer.log`. Sidebar
+entries whose conversation Claude Code has already deleted (it cleans up old
+transcripts) are not listed: they can't be resumed anywhere.
 
 There is deliberately no copy. A copied session could be continued in both
 profiles, and copying it back would silently drop one side's turns. Moving

@@ -705,7 +705,7 @@ struct TransferSheet: View {
                 }
             }
             projectList
-            Text("Sessions move: they leave “\(source?.name ?? "")” once they've arrived (the originals go to the Trash), so each one only ever lives in one profile.")
+            Text("Sessions move: they leave “\(source?.name ?? "")” once they've arrived (originals are kept in Application Support/claude-desktop-profiles/moved), so each one only ever lives in one profile. Sessions whose conversation Claude Code already deleted aren't listed.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -747,7 +747,7 @@ struct TransferSheet: View {
             Button(runningNames.isEmpty ? "Move" : "Quit, Move & Reopen", role: .destructive) { run() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Their sessions leave “\(source?.name ?? "")”. Copies of the originals go to the Trash."
+            Text("Their sessions leave “\(source?.name ?? "")”. The originals are kept in a backup folder."
                  + (runningNames.isEmpty ? "" : "\n\n\(runningNames.joined(separator: " and ")) will quit first and reopen afterwards."))
         }
     }
