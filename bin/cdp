@@ -994,6 +994,270 @@ cmd_list() {
   (( found )) || info "No profiles yet. Create one with: cdp add <name>"
 }
 
+# ---- project transfer -------------------------------------------------------
+#
+# Claude Code keeps each session in two places: the transcript (plus its
+# /rewind history) under the profile's Claude Code config dir, and the
+# Desktop sidebar entry at <dataDir>/claude-code-sessions/<account>/<org>/
+# local_<id>.json. A "project" is a session's cwd, with .claude/worktrees/*
+# folded into the repo they belong to. Sessions in the app's own scratch
+# workspaces are skipped: their folder lives inside the source profile.
+
+# Sidebar entry fields that point at the source account (Remote Control
+# bridges, its connectors, its published artifacts); dropped on transfer.
+SESSION_ACCOUNT_KEYS=(bridgeSessionIds remoteMcpServersConfig enabledMcpTools publishedArtifacts steeredByRemoteClient)
+
+# Reads every sidebar entry in one osascript instead of a plutil per field:
+# prints file, cwd, cliSessionId, lastActivityAt (ms), title, separated by
+# \x1f: a tab would collapse empty fields under `read`.
+SESSION_META_JS='function run(argv) {
+  const out = [];
+  for (const f of argv) {
+    try {
+      const o = JSON.parse(ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(f, $.NSUTF8StringEncoding, null)));
+      const clean = s => String(s || "").replace(/[\t\x1f\n\r]/g, " ");
+      out.push([f, clean(o.cwd), clean(o.cliSessionId), Number(o.lastActivityAt) || 0, clean(o.title)].join("\x1f"));
+    } catch (e) {}
+  }
+  return out.join("\n");
+}'
+
+# "default" is the original install, whose Claude Code uses ~/.claude.
+profile_data_dir() {
+  if [[ "${1:l}" == default ]]; then
+    print -- "$APP_SUPPORT/Claude"
+    return
+  fi
+  local d="$APP_SUPPORT/Claude-$(displayify "$(slugify "$1")")"
+  [[ -d "$d" ]] || err "No profile '$1' (looked for $d)."
+  print -- "$d"
+}
+
+profile_config_dir() {
+  if [[ "$1" == "$APP_SUPPORT/Claude" ]]; then
+    print -- "$HOME/.claude"
+  else
+    config_dir_of_profile "$1"
+  fi
+}
+
+profile_is_running() {
+  if [[ "$1" == "$APP_SUPPORT/Claude" ]]; then
+    ps -axo command= 2>/dev/null | grep -F "/Claude.app/Contents/MacOS/Claude" | grep -v Helper | grep -vF -- "--user-data-dir=" | grep -q .
+  else
+    [[ -n "$(instance_pid "$1")" ]]
+  fi
+}
+
+# cwd recorded in a transcript folder (the first one found in its .jsonl).
+transcript_cwd() {
+  local f m
+  for f in "$1"/*.jsonl(N); do
+    m=$(grep -m1 -o '"cwd":"[^"]*"' "$f" 2>/dev/null) || continue
+    m=${m%%$'\n'*}
+    m=${m#\"cwd\":\"}
+    print -r -- "${m%\"}"
+    return 0
+  done
+  return 1
+}
+
+# Fills the CALLER's assoc arrays (zsh scoping is dynamic): dir_root
+# (transcript dir → project), meta_root / meta_id / meta_last / meta_title
+# (sidebar entry file → project, session id, last activity ms, title).
+scan_profile_sessions() {
+  local data_dir="$1" cfg="$2" scratch="$1/scratch-workspaces/" d root
+  for d in "$cfg"/projects/*(N/); do
+    root=$(transcript_cwd "$d") || continue
+    root=${root%%/.claude/worktrees/*}
+    [[ "$root/" == "$scratch"* ]] && continue
+    dir_root[$d]=$root
+  done
+  local -a files=("$data_dir"/claude-code-sessions/*/*/local_*.json(N))
+  (( ${#files} )) || return 0
+  local f cwd id last title
+  while IFS=$'\x1f' read -r f cwd id last title; do
+    [[ -n "$cwd" ]] || continue
+    root=${cwd%%/.claude/worktrees/*}
+    [[ "$root/" == "$scratch"* ]] && continue
+    meta_root[$f]=$root
+    meta_id[$f]=$id
+    meta_last[$f]=$last
+    meta_title[$f]=$title
+  done < <(osascript -l JavaScript -e "$SESSION_META_JS" "${files[@]}")
+}
+
+# Lists a profile's projects, most recent first. Piped (the GUI reads it):
+# project<TAB>sessions<TAB>last activity (epoch s)<TAB>up to 3 titles.
+cmd_projects() {
+  [[ -n "${1:-}" ]] || err "Usage: cdp projects <profile|default>"
+  local data_dir cfg
+  data_dir=$(profile_data_dir "$1")
+  cfg=$(profile_config_dir "$data_dir")
+  local -A dir_root meta_root meta_id meta_last meta_title
+  scan_profile_sessions "$data_dir" "$cfg"
+
+  local -A count last titles ntitles seen
+  local k r id t f
+  # Sidebar entries first, newest first, so titles come out in that order.
+  for k in ${(f)"$(for k in ${(k)meta_root}; do print -r -- "${meta_last[$k]}"$'\t'"$k"; done | sort -rn | cut -f2-)"}; do
+    r=${meta_root[$k]}
+    id=${meta_id[$k]:-$k}
+    seen[$r$'\t'$id]=1
+    count[$r]=$(( ${count[$r]:-0} + 1 ))
+    t=$(( ${meta_last[$k]:-0} / 1000 ))
+    if (( t > ${last[$r]:-0} )); then last[$r]=$t; fi
+    if [[ -n "${meta_title[$k]}" ]] && (( ${ntitles[$r]:-0} < 3 )); then
+      titles[$r]="${titles[$r]:+${titles[$r]} · }${meta_title[$k]}"
+      ntitles[$r]=$(( ${ntitles[$r]:-0} + 1 ))
+    fi
+  done
+  # Then terminal-only sessions, which have a transcript but no sidebar entry.
+  for k in ${(k)dir_root}; do
+    r=${dir_root[$k]}
+    for f in "$k"/*.jsonl(N); do
+      id=${f:t:r}
+      [[ -n "${seen[$r$'\t'$id]:-}" ]] && continue
+      seen[$r$'\t'$id]=1
+      count[$r]=$(( ${count[$r]:-0} + 1 ))
+      t=$(stat -f %m "$f")
+      if (( t > ${last[$r]:-0} )); then last[$r]=$t; fi
+    done
+  done
+
+  local -a rows
+  for r in ${(k)count}; do
+    rows+=("$r"$'\t'"${count[$r]}"$'\t'"${last[$r]:-0}"$'\t'"${titles[$r]:-}")
+  done
+  (( ${#rows} )) || { [[ -t 1 ]] && info "No Claude Code sessions in this profile."; return 0 }
+  if [[ -t 1 ]]; then
+    local n
+    print -rl -- "${rows[@]}" | sort -t$'\t' -k3,3nr | while IFS=$'\t' read -r r n t k; do
+      print -r -- "  $r"
+      print -r -- "      $n session(s), last $(date -r "$t" '+%Y-%m-%d %H:%M')${k:+ — $k}"
+    done
+  else
+    print -rl -- "${rows[@]}" | sort -t$'\t' -k3,3nr
+  fi
+}
+
+# rsync that never replaces a newer destination file.
+sync_tree() {
+  mkdir -p "$2"
+  rsync -a --update -- "$1/" "$2/"
+}
+
+# True when a repeat sync would change nothing: every source file made it.
+tree_synced() {
+  [[ -z "$(rsync -a --update --dry-run --itemize-changes -- "$1/" "$2/")" ]]
+}
+
+cmd_transfer() {
+  local move=0 force=0 dry=0 a
+  local -a pos
+  for a in "$@"; do
+    case "$a" in
+      --move)    move=1 ;;
+      --force)   force=1 ;;
+      --dry-run) dry=1 ;;
+      -*)        err "Unknown option $a" ;;
+      *)         pos+=("${a%/}") ;;
+    esac
+  done
+  (( ${#pos} >= 3 )) || err "Usage: cdp transfer <from> <to> <project-path>... [--move] [--dry-run] [--force]"
+  local from="${pos[1]}" to="${pos[2]}"
+  local src_data dst_data src_cfg dst_cfg
+  src_data=$(profile_data_dir "$from")
+  dst_data=$(profile_data_dir "$to")
+  [[ "$src_data" != "$dst_data" ]] || err "Source and destination are the same profile."
+  src_cfg=$(profile_config_dir "$src_data")
+  dst_cfg=$(profile_config_dir "$dst_data")
+
+  # A running instance keeps its sidebar in memory and writes it back, which
+  # would drop the new entries (destination) or resurrect moved ones (source).
+  if (( ! force && ! dry )); then
+    profile_is_running "$src_data" && err "Quit '$from' first (Cmd+Q), or pass --force."
+    profile_is_running "$dst_data" && err "Quit '$to' first (Cmd+Q), or pass --force."
+  fi
+
+  local -A want
+  for a in "${pos[@]:2}"; do want[$a]=1; done
+  local -A dir_root meta_root meta_id meta_last meta_title
+  scan_profile_sessions "$src_data" "$src_cfg"
+
+  local -a dirs metas ids
+  local k f
+  for k in ${(k)dir_root}; do
+    [[ -n "${want[${dir_root[$k]}]:-}" ]] || continue
+    dirs+=("$k")
+    for f in "$k"/*.jsonl(N); do ids+=("${f:t:r}"); done
+  done
+  for k in ${(k)meta_root}; do
+    [[ -n "${want[${meta_root[$k]}]:-}" ]] && metas+=("$k")
+  done
+  (( ${#dirs} + ${#metas} )) || err "No sessions found in '$from' for: ${(j:, :)${pos[@]:2}}"
+
+  # Sidebar entries go to the destination account's folder; with several
+  # (sign-ins over time), the most recently used one.
+  local -a dst_session_dirs=("$dst_data"/claude-code-sessions/*/*(N/om))
+  local dst_meta="${dst_session_dirs[1]:-}"
+
+  local verb=Copy
+  (( move )) && verb=Move
+  info "$verb from '$from' to '$to': ${#ids} transcript(s), ${#metas} sidebar entr$( (( ${#metas} == 1 )) && print y || print ies)."
+  if (( dry )); then
+    for k in "${dirs[@]}"; do print -r -- "  transcripts  ${k:t}"; done
+    for k in "${metas[@]}"; do print -r -- "  sidebar      ${meta_title[$k]:-${k:t}}"; done
+    [[ -n "$dst_meta" ]] || warn "'$to' has no Desktop session folder yet: open its Code tab once first."
+    return 0
+  fi
+
+  local id sub
+  for k in "${dirs[@]}"; do sync_tree "$k" "$dst_cfg/projects/${k:t}"; done
+  for id in "${ids[@]}"; do
+    for sub in file-history session-env; do
+      [[ -d "$src_cfg/$sub/$id" ]] && sync_tree "$src_cfg/$sub/$id" "$dst_cfg/$sub/$id"
+    done
+  done
+
+  local dest tmp
+  if [[ -n "$dst_meta" ]]; then
+    for k in "${metas[@]}"; do
+      dest="$dst_meta/${k:t}"
+      [[ -e "$dest" && "$dest" -nt "$k" ]] && continue
+      tmp="$dest.cdp-tmp"
+      cp -p "$k" "$tmp"
+      for a in "${SESSION_ACCOUNT_KEYS[@]}"; do plutil -remove "$a" "$tmp" >/dev/null 2>&1 || true; done
+      mv -f "$tmp" "$dest"
+    done
+  elif (( ${#metas} )); then
+    warn "'$to' has no Desktop session folder yet, so these sessions won't show in its sidebar: open its Code tab once, then run this again. Transcripts were copied (claude --resume finds them)."
+  fi
+  ok "${verb/%y/ie}d ${#ids} transcript(s) to '$to'."
+
+  (( move )) || return 0
+  # Delete from the source only what verifiably arrived; "deleted" means
+  # moved to the Trash, so a bad move is one drag away from undone.
+  local trash="$HOME/.Trash/cdp-transfer-$(date +%Y%m%d-%H%M%S)"
+  for k in "${dirs[@]}"; do
+    tree_synced "$k" "$dst_cfg/projects/${k:t}" || err "Copy of ${k:t} is incomplete; source left untouched."
+  done
+  [[ -n "$dst_meta" ]] || err "Sidebar entries were not copied; source left untouched."
+  for k in "${metas[@]}"; do
+    cmp -s <(plutil -extract cliSessionId raw "$k") <(plutil -extract cliSessionId raw "$dst_meta/${k:t}") ||
+      err "Sidebar entry ${k:t} did not arrive; source left untouched."
+  done
+  mkdir -p "$trash/projects" "$trash/sidebar"
+  for k in "${dirs[@]}"; do mv -- "$k" "$trash/projects/"; done
+  for id in "${ids[@]}"; do
+    for sub in file-history session-env; do
+      [[ -d "$src_cfg/$sub/$id" ]] && { mkdir -p "$trash/$sub"; mv -- "$src_cfg/$sub/$id" "$trash/$sub/" }
+    done
+  done
+  for k in "${metas[@]}"; do mv -- "$k" "$trash/sidebar/"; done
+  ok "Removed them from '$from' (kept in the Trash: ${trash:t})."
+}
+
 cmd_remove() {
   local raw="${1:-}" mode="${2:-}"
   [[ -n "$raw" ]] || err "Usage: cdp remove <name> [--keep-data|--delete-data]"
@@ -1052,6 +1316,14 @@ USAGE
                       Change a profile's icon color
                       (orange red yellow green teal blue purple pink)
   cdp list            List profiles and launcher health
+  cdp projects <profile>
+                      List a profile's Claude Code projects and sessions
+                      ("default" is your main install)
+  cdp transfer <from> <to> <project-path>... [--move] [--dry-run]
+                      Copy those projects' sessions (transcripts, /rewind
+                      history, sidebar entries) to another profile; --move
+                      also removes them from <from> (into the Trash). Both
+                      profiles must be quit (or pass --force)
   cdp remove <name>   Remove a profile's launcher; add --keep-data or
                       --delete-data to skip the interactive question
   cdp gui             Build + install the "Claude Profiles" SwiftUI app
@@ -1079,6 +1351,8 @@ case "${1:-help}" in
   watchdog) shift; cmd_watchdog "$@" ;;
   color)   shift; cmd_color "$@" ;;
   list)    cmd_list ;;
+  projects) shift; cmd_projects "$@" ;;
+  transfer) shift; cmd_transfer "$@" ;;
   remove)  shift; cmd_remove "$@" ;;
   gui)     cmd_gui ;;
   chooser) shift; cmd_chooser "$@" ;;

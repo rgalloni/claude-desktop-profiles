@@ -24,6 +24,7 @@ HELPER_REL="Contents/Resources/Claude Profiles Helper.app/Contents/MacOS/Claude 
 version=$(zsh bin/cdp version)
 
 check "cdp parses" zsh -n bin/cdp
+check "project transfer" scripts/test-transfer.sh
 if [[ "${1:-}" != "--no-build" ]]; then
   scripts/build.sh >/dev/null 2>&1 || { print -- "FAIL build"; exit 1 }
 fi
